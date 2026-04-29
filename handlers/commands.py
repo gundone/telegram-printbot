@@ -1,4 +1,5 @@
 import logging
+import re
 import subprocess
 
 from telegram import Update
@@ -84,3 +85,53 @@ async def status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         capture_output=True, text=True, timeout=10,
     )
     await update.message.reply_text(result.stdout.strip() or "Нет информации.")
+
+
+def _parse_printer_line(line: str) -> tuple[str, str, str] | None:
+    m = re.match(r"printer (\S+) .+ (enabled|disabled) since (.+)", line)
+    if not m:
+        return None
+    return m.group(1), m.group(2), m.group(3)
+
+
+async def printers(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("\U0001f512 Нет доступа.")
+        return
+
+    result = subprocess.run(
+        ["lpstat", "-p"],
+        capture_output=True, text=True, timeout=10,
+    )
+    default_result = subprocess.run(
+        ["lpstat", "-d"],
+        capture_output=True, text=True, timeout=10,
+    )
+    default_name = ""
+    dm = re.search(r"destination: (\S+)", default_result.stdout)
+    if dm:
+        default_name = dm.group(1)
+
+    lines = []
+    for raw_line in result.stdout.strip().splitlines():
+        parsed = _parse_printer_line(raw_line)
+        if not parsed:
+            continue
+        name, state, since = parsed
+        if state == "enabled":
+            emoji = "\u2705"
+            status_text = "в сети"
+        else:
+            emoji = "\U0001f534"
+            status_text = "не в сети"
+        default_mark = " \u2b50" if name == default_name else ""
+        lines.append(f"{emoji} {name}{default_mark} \u2014 {status_text}")
+
+    if not lines:
+        await update.message.reply_text("Принтеры не найдены.")
+        return
+
+    await update.message.reply_text(
+        "\U0001f5a8 Принтеры:\n\n" + "\n".join(lines)
+        + "\n\n\u2b50 \u2014 по умолчанию"
+    )

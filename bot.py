@@ -20,6 +20,7 @@ from handlers import (
     handle_document,
     handle_photo,
     handle_text,
+    printers,
     start,
     status,
     whoami,
@@ -42,6 +43,7 @@ def main() -> None:
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("printers", printers))
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
