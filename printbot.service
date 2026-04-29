@@ -1,0 +1,14 @@
+[Unit]
+Description=Telegram Print Bot
+After=network.target cups.service
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/printbot/.env
+ExecStart=/opt/printbot/venv/bin/python3 /opt/printbot/bot.py
+WorkingDirectory=/opt/printbot
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
