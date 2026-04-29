@@ -45,6 +45,9 @@ OFFICE_EXTENSIONS = {
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".gif"}
 
+# nup → approximate text scale (2-on-1 landscape side-by-side ≈ 70%)
+_NUP_SCALE = {1: 100, 2: 70, 4: 50}
+
 # {job_key: {path, file_name, user_id, pages, total_pages, copies, nup}}
 _pending_jobs: dict[str, dict] = {}
 
@@ -106,6 +109,32 @@ def _get_page_count(pdf_path: str) -> int:
     return 1
 
 
+def _count_selected_pages(job: dict) -> int:
+    """Calculate how many pages are selected by the page range."""
+    pages = job.get("pages", "all")
+    total = job["total_pages"]
+    if pages == "all":
+        return total
+    count = 0
+    for part in pages.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            lo = max(1, int(lo))
+            hi = min(total, int(hi))
+            count += max(0, hi - lo + 1)
+        elif part.isdigit():
+            count += 1
+    return max(count, 1)
+
+
+def _calc_sheets(job: dict) -> int:
+    """Calculate how many physical sheets will be printed."""
+    selected = _count_selected_pages(job)
+    nup = job.get("nup", 1)
+    return -(-selected // nup)  # ceil division
+
+
 def _build_lp_command(path: str, job: dict) -> list[str]:
     cmd = ["lp", "-d", PRINTER, "-o", "PageSize=A4", "-o", "fit-to-page"]
     pages = job.get("pages", "all")
@@ -116,7 +145,8 @@ def _build_lp_command(path: str, job: dict) -> list[str]:
         cmd.extend(["-n", str(copies)])
     nup = job.get("nup", 1)
     if nup > 1:
-        cmd.extend(["-o", f"number-up={nup}"])
+        cmd.extend(["-o", f"number-up={nup}",
+                     "-o", "number-up-layout=lrtb"])
     cmd.append(path)
     return cmd
 
@@ -245,13 +275,37 @@ def _cleanup_pending(key: str) -> None:
 
 def _options_text(job: dict) -> str:
     pages_str = "все" if job["pages"] == "all" else job["pages"]
-    return (
-        f"\U0001f4c4 {job['file_name']} ({job['total_pages']} стр.)\n\n"
-        f"\u2699\ufe0f Настройки печати:\n"
-        f"\u2022 Страницы: {pages_str}\n"
-        f"\u2022 Копии: {job['copies']}\n"
-        f"\u2022 На листе: {job['nup']}"
-    )
+    selected = _count_selected_pages(job)
+    sheets = _calc_sheets(job)
+    nup = job.get("nup", 1)
+    scale = _NUP_SCALE.get(nup, 100)
+
+    nup_str = f"{nup} на листе (~{scale}%)" if nup > 1 else "1 на листе"
+    sheets_word = _sheets_word(sheets)
+    copies_total = sheets * job["copies"]
+
+    lines = [
+        f"\U0001f4c4 {job['file_name']} ({job['total_pages']} стр.)",
+        "",
+        f"\u2699\ufe0f Настройки печати:",
+        f"\u2022 Страницы: {pages_str} ({selected} стр.)",
+        f"\u2022 Копии: {job['copies']}",
+        f"\u2022 Размещение: {nup_str}",
+        "",
+        f"\U0001f4e4 Итого: {copies_total} {sheets_word}",
+    ]
+    return "\n".join(lines)
+
+
+def _sheets_word(n: int) -> str:
+    if 11 <= n % 100 <= 19:
+        return f"{n} листов"
+    last = n % 10
+    if last == 1:
+        return f"{n} лист"
+    if 2 <= last <= 4:
+        return f"{n} листа"
+    return f"{n} листов"
 
 
 def _options_keyboard(key: str) -> InlineKeyboardMarkup:
@@ -259,7 +313,12 @@ def _options_keyboard(key: str) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("\U0001f4c4 Страницы", callback_data=f"pg:{key}"),
             InlineKeyboardButton("\U0001f4cb Копии", callback_data=f"cp:{key}"),
-            InlineKeyboardButton("\U0001f4d0 На листе", callback_data=f"nu:{key}"),
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f4d0 Уместить на меньше листов",
+                callback_data=f"ft:{key}",
+            ),
         ],
         [InlineKeyboardButton("\U0001f5a8 Печатать", callback_data=f"go:{key}")],
     ])
@@ -294,15 +353,30 @@ def _copies_keyboard(key: str) -> InlineKeyboardMarkup:
     ])
 
 
-def _nup_keyboard(key: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("1", callback_data=f"np:1:{key}"),
-            InlineKeyboardButton("2", callback_data=f"np:2:{key}"),
-            InlineKeyboardButton("4", callback_data=f"np:4:{key}"),
-        ],
+def _fit_keyboard(key: str) -> InlineKeyboardMarkup:
+    job = _pending_jobs.get(key)
+    if not job:
+        return InlineKeyboardMarkup([])
+    selected = _count_selected_pages(job)
+    buttons = []
+
+    for nup in (1, 2, 4):
+        sheets = -(-selected // nup)
+        scale = _NUP_SCALE.get(nup, 100)
+        if nup == 1:
+            label = f"Без уменьшения \u2014 {_sheets_word(sheets)}"
+        else:
+            label = f"~{scale}% \u2014 {_sheets_word(sheets)} ({nup} на листе)"
+        # Only show if it actually reduces sheets vs nup=1
+        if nup == 1 or sheets < selected:
+            buttons.append([
+                InlineKeyboardButton(label, callback_data=f"np:{nup}:{key}"),
+            ])
+
+    buttons.append(
         [InlineKeyboardButton("\u2b05\ufe0f Назад", callback_data=f"bk:{key}")],
-    ])
+    )
+    return InlineKeyboardMarkup(buttons)
 
 
 # ── Callback query handler ────────────────────────────────────
@@ -322,8 +396,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await _cb_copies_menu(query, data)
     elif data.startswith("cn:"):
         await _cb_copies_set(query, data)
-    elif data.startswith("nu:"):
-        await _cb_nup_menu(query, data)
+    elif data.startswith("ft:"):
+        await _cb_fit_menu(query, data)
     elif data.startswith("np:"):
         await _cb_nup_set(query, data)
     elif data.startswith("bk:"):
@@ -395,14 +469,16 @@ async def _cb_copies_set(query, data: str) -> None:
     )
 
 
-async def _cb_nup_menu(query, data: str) -> None:
+async def _cb_fit_menu(query, data: str) -> None:
     key = data.split(":")[1]
-    if key not in _pending_jobs:
+    job = _pending_jobs.get(key)
+    if not job:
         await query.edit_message_text("Задание не найдено.")
         return
+    selected = _count_selected_pages(job)
     await query.edit_message_text(
-        "\U0001f4d0 Страниц на листе:",
-        reply_markup=_nup_keyboard(key),
+        f"\U0001f4d0 Уместить {selected} стр. на меньше листов:",
+        reply_markup=_fit_keyboard(key),
     )
 
 
