@@ -4,12 +4,15 @@ import json
 import logging
 import os
 import re
+import secrets
+import shutil
 import subprocess
 import tempfile
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     filters,
@@ -21,6 +24,7 @@ PRINTER = os.environ.get("PRINTER", "KX-MB1500")
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 INVITE_CODE_FILE = "/opt/printbot/invite_code.txt"
 USERS_FILE = "/opt/printbot/users.json"
+PENDING_DIR = "/opt/printbot/pending"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -38,6 +42,13 @@ OFFICE_EXTENSIONS = {
     ".doc", ".docx", ".odt", ".xls", ".xlsx", ".ods",
     ".ppt", ".pptx", ".odp", ".rtf", ".csv", ".txt",
 }
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".gif"}
+
+# {job_key: {path, file_name, user_id, pages, total_pages, copies, nup}}
+_pending_jobs: dict[str, dict] = {}
+
+# ── Auth helpers ──────────────────────────────────────────────
 
 
 def _load_users() -> dict:
@@ -71,23 +82,48 @@ def _is_authorized(user_id: int) -> bool:
     return str(user_id) in users
 
 
+# ── File / print helpers ─────────────────────────────────────
+
+
 def _convert_to_pdf(src: str, tmp_dir: str) -> str:
     subprocess.run(
-        ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", tmp_dir, src],
-        check=True,
-        timeout=120,
+        ["libreoffice", "--headless", "--convert-to", "pdf",
+         "--outdir", tmp_dir, src],
+        check=True, timeout=120,
     )
     base = os.path.splitext(os.path.basename(src))[0]
     return os.path.join(tmp_dir, base + ".pdf")
 
 
-def _print_file(path: str) -> str:
+def _get_page_count(pdf_path: str) -> int:
     result = subprocess.run(
-        ["lp", "-d", PRINTER, "-o", "PageSize=A4", "-o", "fit-to-page", path],
-        capture_output=True,
-        text=True,
-        timeout=30,
+        ["pdfinfo", pdf_path],
+        capture_output=True, text=True, timeout=10,
     )
+    for line in result.stdout.splitlines():
+        if line.startswith("Pages:"):
+            return int(line.split(":")[1].strip())
+    return 1
+
+
+def _build_lp_command(path: str, job: dict) -> list[str]:
+    cmd = ["lp", "-d", PRINTER, "-o", "PageSize=A4", "-o", "fit-to-page"]
+    pages = job.get("pages", "all")
+    if pages != "all":
+        cmd.extend(["-P", pages])
+    copies = job.get("copies", 1)
+    if copies > 1:
+        cmd.extend(["-n", str(copies)])
+    nup = job.get("nup", 1)
+    if nup > 1:
+        cmd.extend(["-o", f"number-up={nup}"])
+    cmd.append(path)
+    return cmd
+
+
+def _print_file_with_options(path: str, job: dict) -> str:
+    cmd = _build_lp_command(path, job)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip())
     return result.stdout.strip()
@@ -98,6 +134,9 @@ def _extract_job_id(lp_output: str) -> str:
     if m:
         return m.group(1)
     return ""
+
+
+# ── Job status tracking ──────────────────────────────────────
 
 
 def _get_job_status(job_id: str) -> str:
@@ -131,8 +170,10 @@ def _get_job_status(job_id: str) -> str:
 def _format_status(status: str, job_id: str, file_name: str) -> str:
     if status.startswith("error:"):
         reason = status.split(":", 1)[1]
-        return f"\u274c Ошибка печати: {file_name}\nЗадание: {job_id}\nПричина: {reason}"
-
+        return (
+            f"\u274c Ошибка печати: {file_name}\n"
+            f"Задание: {job_id}\nПричина: {reason}"
+        )
     labels = {
         "queued": ("\u23f3", "В очереди"),
         "completed": ("\u2705", "Напечатано"),
@@ -144,27 +185,321 @@ def _format_status(status: str, job_id: str, file_name: str) -> str:
 async def _poll_job(msg, job_id: str, file_name: str) -> None:
     for _ in range(30):
         await asyncio.sleep(2)
-        status = _get_job_status(job_id)
-        if status == "completed":
+        st = _get_job_status(job_id)
+        if st == "completed":
             await msg.edit_text(_format_status("completed", job_id, file_name))
             return
-        if status.startswith("error:"):
-            await msg.edit_text(_format_status(status, job_id, file_name))
+        if st.startswith("error:"):
+            await msg.edit_text(_format_status(st, job_id, file_name))
             return
     await msg.edit_text(
         _format_status("queued", job_id, file_name) + "\n(таймаут ожидания)"
     )
 
 
-async def _send_and_track(msg, print_path: str, file_name: str, user) -> None:
-    lp_out = _print_file(print_path)
+async def _send_and_track(msg, path: str, file_name: str, user, job: dict) -> None:
+    lp_out = _print_file_with_options(path, job)
     job_id = _extract_job_id(lp_out)
     logger.info(
-        "User %s (%d) printed %s, job %s",
+        "User %s (%d) printed %s, job %s, opts: pages=%s copies=%d nup=%d",
         user.full_name, user.id, file_name, job_id,
+        job.get("pages", "all"), job.get("copies", 1), job.get("nup", 1),
     )
     await msg.edit_text(_format_status("queued", job_id, file_name))
     await _poll_job(msg, job_id, file_name)
+
+
+# ── Pending job management ───────────────────────────────────
+
+
+def _create_pending_job(
+    src_path: str, file_name: str, user_id: int, total_pages: int,
+) -> str:
+    key = secrets.token_hex(4)
+    os.makedirs(PENDING_DIR, exist_ok=True)
+    job_dir = os.path.join(PENDING_DIR, key)
+    os.makedirs(job_dir)
+    dest = os.path.join(job_dir, os.path.basename(src_path))
+    shutil.copy2(src_path, dest)
+    _pending_jobs[key] = {
+        "path": dest,
+        "file_name": file_name,
+        "user_id": user_id,
+        "total_pages": total_pages,
+        "pages": "all",
+        "copies": 1,
+        "nup": 1,
+    }
+    return key
+
+
+def _cleanup_pending(key: str) -> None:
+    job = _pending_jobs.pop(key, None)
+    if job:
+        job_dir = os.path.dirname(job["path"])
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+# ── Options UI ────────────────────────────────────────────────
+
+
+def _options_text(job: dict) -> str:
+    pages_str = "все" if job["pages"] == "all" else job["pages"]
+    return (
+        f"\U0001f4c4 {job['file_name']} ({job['total_pages']} стр.)\n\n"
+        f"\u2699\ufe0f Настройки печати:\n"
+        f"\u2022 Страницы: {pages_str}\n"
+        f"\u2022 Копии: {job['copies']}\n"
+        f"\u2022 На листе: {job['nup']}"
+    )
+
+
+def _options_keyboard(key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("\U0001f4c4 Страницы", callback_data=f"pg:{key}"),
+            InlineKeyboardButton("\U0001f4cb Копии", callback_data=f"cp:{key}"),
+            InlineKeyboardButton("\U0001f4d0 На листе", callback_data=f"nu:{key}"),
+        ],
+        [InlineKeyboardButton("\U0001f5a8 Печатать", callback_data=f"go:{key}")],
+    ])
+
+
+def _pages_keyboard(key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Все", callback_data=f"ps:all:{key}"),
+            InlineKeyboardButton("Первая", callback_data=f"ps:1:{key}"),
+            InlineKeyboardButton("Последняя", callback_data=f"ps:last:{key}"),
+        ],
+        [
+            InlineKeyboardButton(
+                "\u270f\ufe0f Ввести диапазон", callback_data=f"ps:inp:{key}",
+            ),
+        ],
+        [InlineKeyboardButton("\u2b05\ufe0f Назад", callback_data=f"bk:{key}")],
+    ])
+
+
+def _copies_keyboard(key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1", callback_data=f"cn:1:{key}"),
+            InlineKeyboardButton("2", callback_data=f"cn:2:{key}"),
+            InlineKeyboardButton("3", callback_data=f"cn:3:{key}"),
+            InlineKeyboardButton("5", callback_data=f"cn:5:{key}"),
+            InlineKeyboardButton("10", callback_data=f"cn:10:{key}"),
+        ],
+        [InlineKeyboardButton("\u2b05\ufe0f Назад", callback_data=f"bk:{key}")],
+    ])
+
+
+def _nup_keyboard(key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1", callback_data=f"np:1:{key}"),
+            InlineKeyboardButton("2", callback_data=f"np:2:{key}"),
+            InlineKeyboardButton("4", callback_data=f"np:4:{key}"),
+        ],
+        [InlineKeyboardButton("\u2b05\ufe0f Назад", callback_data=f"bk:{key}")],
+    ])
+
+
+# ── Callback query handler ────────────────────────────────────
+
+
+async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
+
+    if data.startswith("pg:"):
+        await _cb_pages_menu(query, data)
+    elif data.startswith("ps:"):
+        await _cb_pages_set(query, data, ctx, user_id)
+    elif data.startswith("cp:"):
+        await _cb_copies_menu(query, data)
+    elif data.startswith("cn:"):
+        await _cb_copies_set(query, data)
+    elif data.startswith("nu:"):
+        await _cb_nup_menu(query, data)
+    elif data.startswith("np:"):
+        await _cb_nup_set(query, data)
+    elif data.startswith("bk:"):
+        await _cb_back(query, data)
+    elif data.startswith("go:"):
+        await _cb_print(query, data, update.effective_user)
+
+
+async def _cb_pages_menu(query, data: str) -> None:
+    key = data.split(":")[1]
+    job = _pending_jobs.get(key)
+    if not job:
+        await query.edit_message_text("Задание не найдено.")
+        return
+    await query.edit_message_text(
+        f"\U0001f4c4 Выберите страницы (всего {job['total_pages']}):",
+        reply_markup=_pages_keyboard(key),
+    )
+
+
+async def _cb_pages_set(query, data: str, ctx, user_id: int) -> None:
+    parts = data.split(":")
+    value, key = parts[1], parts[2]
+    job = _pending_jobs.get(key)
+    if not job:
+        await query.edit_message_text("Задание не найдено.")
+        return
+
+    if value == "inp":
+        ctx.user_data["awaiting_pages"] = key
+        await query.edit_message_text(
+            f"Введите диапазон страниц (1\u2013{job['total_pages']}).\n"
+            "Примеры: 1-3  или  1,3,5  или  2-4,7"
+        )
+        return
+    if value == "all":
+        job["pages"] = "all"
+    elif value == "last":
+        job["pages"] = str(job["total_pages"])
+    else:
+        job["pages"] = value
+
+    await query.edit_message_text(
+        _options_text(job), reply_markup=_options_keyboard(key),
+    )
+
+
+async def _cb_copies_menu(query, data: str) -> None:
+    key = data.split(":")[1]
+    if key not in _pending_jobs:
+        await query.edit_message_text("Задание не найдено.")
+        return
+    await query.edit_message_text(
+        "\U0001f4cb Количество копий:",
+        reply_markup=_copies_keyboard(key),
+    )
+
+
+async def _cb_copies_set(query, data: str) -> None:
+    parts = data.split(":")
+    value, key = int(parts[1]), parts[2]
+    job = _pending_jobs.get(key)
+    if not job:
+        await query.edit_message_text("Задание не найдено.")
+        return
+    job["copies"] = value
+    await query.edit_message_text(
+        _options_text(job), reply_markup=_options_keyboard(key),
+    )
+
+
+async def _cb_nup_menu(query, data: str) -> None:
+    key = data.split(":")[1]
+    if key not in _pending_jobs:
+        await query.edit_message_text("Задание не найдено.")
+        return
+    await query.edit_message_text(
+        "\U0001f4d0 Страниц на листе:",
+        reply_markup=_nup_keyboard(key),
+    )
+
+
+async def _cb_nup_set(query, data: str) -> None:
+    parts = data.split(":")
+    value, key = int(parts[1]), parts[2]
+    job = _pending_jobs.get(key)
+    if not job:
+        await query.edit_message_text("Задание не найдено.")
+        return
+    job["nup"] = value
+    await query.edit_message_text(
+        _options_text(job), reply_markup=_options_keyboard(key),
+    )
+
+
+async def _cb_back(query, data: str) -> None:
+    key = data.split(":")[1]
+    job = _pending_jobs.get(key)
+    if not job:
+        await query.edit_message_text("Задание не найдено.")
+        return
+    await query.edit_message_text(
+        _options_text(job), reply_markup=_options_keyboard(key),
+    )
+
+
+async def _cb_print(query, data: str, user) -> None:
+    key = data.split(":")[1]
+    job = _pending_jobs.get(key)
+    if not job:
+        await query.edit_message_text("Задание не найдено.")
+        return
+
+    await query.edit_message_text("\U0001f5a8 Отправляю на печать...")
+    try:
+        await _send_and_track(
+            query.message, job["path"], job["file_name"], user, job,
+        )
+    except Exception as e:
+        await query.edit_message_text(f"\u274c Ошибка печати: {e}")
+        logger.error("Print failed for %s: %s", job["file_name"], e)
+    finally:
+        _cleanup_pending(key)
+
+
+# ── Text input handler (page range) ──────────────────────────
+
+
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    key = ctx.user_data.pop("awaiting_pages", None)
+    if not key:
+        return
+    job = _pending_jobs.get(key)
+    if not job:
+        await update.message.reply_text("Задание не найдено или истекло.")
+        return
+
+    text = update.message.text.strip()
+    if not re.match(r"^[\d,\- ]+$", text):
+        await update.message.reply_text(
+            "\u274c Неверный формат. Примеры: 1-3  или  1,3,5  или  2-4,7"
+        )
+        ctx.user_data["awaiting_pages"] = key
+        return
+
+    job["pages"] = text.replace(" ", "")
+    await update.message.reply_text(
+        _options_text(job), reply_markup=_options_keyboard(key),
+    )
+
+
+# ── Download and prepare file ─────────────────────────────────
+
+
+async def _download_and_prepare(
+    ctx, doc_file_id: str, file_name: str, ext: str, msg,
+) -> tuple[str, str, int]:
+    """Download file, convert if needed, return (print_path, pdf_path, pages)."""
+    tmp_dir = tempfile.mkdtemp()
+    tg_file = await ctx.bot.get_file(doc_file_id)
+    local_path = os.path.join(tmp_dir, file_name)
+    await tg_file.download_to_drive(local_path)
+
+    print_path = local_path
+    if ext in OFFICE_EXTENSIONS:
+        await msg.edit_text("\U0001f504 Конвертирую в PDF...")
+        print_path = _convert_to_pdf(local_path, tmp_dir)
+
+    pages = 1
+    if ext == ".pdf" or ext in OFFICE_EXTENSIONS:
+        pages = _get_page_count(print_path)
+
+    return print_path, tmp_dir, pages
+
+
+# ── Command handlers ──────────────────────────────────────────
 
 
 async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -172,14 +507,14 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if _is_authorized(user_id):
         await update.message.reply_text(
             "\U0001f5a8 Принт-бот\n\n"
-            "Отправь документ или фото — я напечатаю.\n"
+            "Отправь документ или фото \u2014 я напечатаю.\n"
+            "Для многостраничных документов предложу настройки.\n\n"
             "Форматы: PDF, изображения, Word, Excel, PowerPoint, текст.\n\n"
-            "/status — статус принтера"
+            "/status \u2014 статус принтера"
         )
     else:
         await update.message.reply_text(
-            "\U0001f512 Доступ ограничен.\n"
-            "Введите код: /auth <код>"
+            "\U0001f512 Доступ ограничен.\nВведите код: /auth <код>"
         )
 
 
@@ -233,9 +568,8 @@ async def cmd_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
         return
 
-    new_code = ctx.args[0]
-    _set_invite_code(new_code)
-    await update.message.reply_text(f"\u2705 Инвайт-код изменён: {new_code}")
+    _set_invite_code(ctx.args[0])
+    await update.message.reply_text(f"\u2705 Инвайт-код изменён: {ctx.args[0]}")
 
 
 async def cmd_users(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -304,6 +638,9 @@ async def status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(result.stdout.strip() or "Нет информации.")
 
 
+# ── Document / photo handlers ─────────────────────────────────
+
+
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not _is_authorized(user.id):
@@ -326,26 +663,30 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
     msg = await update.message.reply_text("\u2b07\ufe0f Скачиваю...")
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        file = await ctx.bot.get_file(doc.file_id)
-        local_path = os.path.join(tmp_dir, file_name)
-        await file.download_to_drive(local_path)
+    try:
+        print_path, tmp_dir, pages = await _download_and_prepare(
+            ctx, doc.file_id, file_name, ext, msg,
+        )
+    except Exception as e:
+        await msg.edit_text(f"\u274c Ошибка: {e}")
+        return
 
-        print_path = local_path
-        if ext in OFFICE_EXTENSIONS:
-            await msg.edit_text("\U0001f504 Конвертирую в PDF...")
-            try:
-                print_path = _convert_to_pdf(local_path, tmp_dir)
-            except Exception as e:
-                await msg.edit_text(f"\u274c Ошибка конвертации: {e}")
-                return
-
+    if pages > 1:
+        key = _create_pending_job(print_path, file_name, user.id, pages)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        job = _pending_jobs[key]
+        await msg.edit_text(
+            _options_text(job), reply_markup=_options_keyboard(key),
+        )
+    else:
         await msg.edit_text("\U0001f5a8 Отправляю на печать...")
         try:
-            await _send_and_track(msg, print_path, file_name, user)
+            job = {"pages": "all", "copies": 1, "nup": 1}
+            await _send_and_track(msg, print_path, file_name, user, job)
         except Exception as e:
             await msg.edit_text(f"\u274c Ошибка печати: {e}")
-            logger.error("Print failed for %s: %s", file_name, e)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -359,21 +700,28 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     photo = update.message.photo[-1]
     msg = await update.message.reply_text("\u2b07\ufe0f Скачиваю фото...")
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        file = await ctx.bot.get_file(photo.file_id)
-        local_path = os.path.join(tmp_dir, "photo.jpg")
-        await file.download_to_drive(local_path)
+    tmp_dir = tempfile.mkdtemp()
+    tg_file = await ctx.bot.get_file(photo.file_id)
+    local_path = os.path.join(tmp_dir, "photo.jpg")
+    await tg_file.download_to_drive(local_path)
 
-        await msg.edit_text("\U0001f5a8 Отправляю на печать...")
-        try:
-            await _send_and_track(msg, local_path, "photo.jpg", user)
-        except Exception as e:
-            await msg.edit_text(f"\u274c Ошибка печати: {e}")
-            logger.error("Print photo failed: %s", e)
+    await msg.edit_text("\U0001f5a8 Отправляю на печать...")
+    try:
+        job = {"pages": "all", "copies": 1, "nup": 1}
+        await _send_and_track(msg, local_path, "photo.jpg", user, job)
+    except Exception as e:
+        await msg.edit_text(f"\u274c Ошибка печати: {e}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ── Main ──────────────────────────────────────────────────────
 
 
 def main() -> None:
+    os.makedirs(PENDING_DIR, exist_ok=True)
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("auth", auth))
     app.add_handler(CommandHandler("code", cmd_code))
@@ -381,8 +729,13 @@ def main() -> None:
     app.add_handler(CommandHandler("revoke", cmd_revoke))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("whoami", whoami))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text),
+    )
+
     logger.info("Bot started")
     app.run_polling(drop_pending_updates=True)
 
